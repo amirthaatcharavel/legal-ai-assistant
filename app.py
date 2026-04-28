@@ -16,6 +16,7 @@ from firebase_admin import credentials, firestore
 from data.constitution import ARTICLES
 from tools.summarizer import summarize, summarize_text, extract_text
 from tools.comparator import compare
+from tools.legal_api import fetch_case_context
 from rag_pipeline import add_cases_to_db, retrieve_context
 from tools.legal_api import extract_case_data
 from tools.legal_api import (
@@ -57,6 +58,48 @@ app.add_middleware(
 from bs4 import BeautifulSoup
 import re
 import requests
+tool_definitions = [
+    {
+        "name": "summarize",
+        "description": "Summarize a legal case or document"
+    },
+    {
+        "name": "compare",
+        "description": "Compare two legal cases or document with case"
+    },
+    {
+        "name": "fetch",
+        "description": "Fetch legal cases from Indian Kanoon"
+    }
+]
+def decide_tool(query):
+    prompt = f"""
+You are an AI assistant.
+
+Decide which tool to use.
+
+Return ONLY one word:
+summarize OR compare OR fetch
+
+Query:
+{query}
+"""
+
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        tool = completion.choices[0].message.content.strip().lower()
+
+        if tool not in ["summarize", "compare", "fetch"]:
+            return "fetch"
+
+        return tool
+
+    except:
+        return "fetch"
 
 def select_best_case(query, cases):
     import re
@@ -291,18 +334,7 @@ Key Points:
 
     return None
 
-# =========================
-# 🧠 TOOL DETECTION
-# =========================
-def detect_tool(query: str):
-    q = query.lower()
 
-    if "compare" in q:
-        return "compare"
-    elif "summarize" in q or "explain case" in q:
-        return "summarize"
-    else:
-        return "fetch"
 
 # =========================
 # 🔍 HELPERS
@@ -354,6 +386,60 @@ def rewrite_query(user_query):
 
 @app.post("/ask")
 async def ask(request: AskRequest):
+    # =========================
+    # 🧠 MCP-LITE TOOLS
+    # =========================
+
+    def summarize_tool(context):
+        return summarize_text(context)
+
+
+    def compare_tool(context, cases):
+        prompt = f"""
+    You are a legal expert.
+
+    Compare the two cases strictly using ONLY the given context.
+
+    Context:
+    {context}
+
+    STRICT FORMAT:
+
+    Case 1: {cases[0]['title']}
+    Case 2: {cases[1]['title']}
+
+    Facts:
+    - ...
+
+    Issue:
+    - ...
+
+    Similarities:
+    - ...
+
+    Differences:
+    - ...
+
+    Judgment:
+    - ...
+    """
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return clean_llm_output(completion.choices[0].message.content)
+
+
+    # 🔥 TOOL REGISTRY
+    tools = {
+        "summarize": summarize_tool,
+        "compare": compare_tool
+    }
+    context = ""
+    user_id = request.user_id or "guest"
+    has_uploaded_doc = user_id in uploaded_text_store
 
     original_query = request.question.strip()
     query = original_query
@@ -366,21 +452,18 @@ async def ask(request: AskRequest):
     print("🔍 Refined Query:", query)
 
     # =========================
-    # 🧠 TOOL DETECTION
+    # 🤖 LLM TOOL SELECTION
     # =========================
-    if any(word in q_lower for word in ["summarize", "summary", "explain"]):
-        tool = "summarize"
-    elif "compare" in q_lower:
-        tool = "compare"
-    else:
-        tool = "fetch"
-
-    print("TOOL SELECTED:", tool)
+    tool = decide_tool(original_query)
+    print("🤖 LLM SELECTED TOOL:", tool)
 
     # =========================
     # 🔥 NEW: UPLOADED DOCUMENT PRIORITY
     # =========================
-    user_id = request.user_id or "guest"
+    
+    print("🧠 Uploaded store keys:", uploaded_text_store.keys())
+    print("🧠 Current user:", user_id)
+
 
     # ⚠️ IMPORTANT: make sure this exists at top of file
     # uploaded_text_store = {}
@@ -473,6 +556,7 @@ async def ask(request: AskRequest):
 
         import urllib.parse
         user_id = request.user_id or "guest"
+        
 
         # =========================
         # 🔥 CLEAN QUERY
@@ -488,7 +572,7 @@ async def ask(request: AskRequest):
         # =========================
         # 🔥 CASE: UPLOADED DOC EXISTS
         # =========================
-        if user_id in uploaded_text_store:
+        if has_uploaded_doc and "compare with" in original_query.lower():
 
             if len(parts) < 1:
                 return {
@@ -496,7 +580,7 @@ async def ask(request: AskRequest):
                     "tool": "compare"
                 }
 
-            case_query = parts[0]
+            case_query = original_query.lower().replace("compare with", "").strip()
 
             print("📄 Using uploaded document")
             print("⚖️ Comparing with:", case_query)
@@ -550,16 +634,24 @@ async def ask(request: AskRequest):
                     "tool": "compare"
                 }
 
-            context += f"Case 2: {external_case['title']}\n{text}\n\n"
+            context += f"""
+            Case 2: {external_case['title']}
 
-            cases = ["Uploaded Document", external_case["title"]]
+            Full Judgment:
+            {text}
+            """
+
+            cases = [
+                {"title": "Uploaded Document"},
+                {"title": external_case["title"]}
+            ]
 
         # =========================
         # 🔥 NORMAL CASE VS CASE
         # =========================
         else:
 
-            if len(parts) < 2:
+            if len(parts) < 2 and not has_uploaded_doc:
                 return {
                     "answer": "⚠️ Please provide two cases using 'and'.",
                     "tool": "compare"
@@ -621,35 +713,41 @@ async def ask(request: AskRequest):
                 if text:
                     context += f"Case: {c['title']}\n{text}\n\n"
 
-            cases = [c["title"] for c in cases_data]
+            cases = cases_data
 
     # =========================
-    # 🔥 STEP 3: FETCH CONTEXT
+    # 🔥 STEP 3: FETCH CONTEXT (ONLY IF NOT ALREADY BUILT)
     # =========================
-    from tools.legal_api import fetch_case_context
+    
 
-    context = ""
+    if not context:   # ✅ VERY IMPORTANT CHECK
 
-    try:
-        for case in cases:
-            print("📥 Fetching:", case["title"])
+        context = ""
 
-            text = fetch_case_context(case["link"])
+        try:
+            for case in cases:
+                print("📥 Fetching:", case["title"])
 
-            print("TEXT LENGTH:", len(text) if text else 0)
+                text = fetch_case_context(case["link"])
 
-            if text:
-                context += f"Case: {case['title']}\n{text}\n\n"
+                print("TEXT LENGTH:", len(text) if text else 0)
 
-    except Exception as e:
-        print("❌ Context fetch error:", e)
+                if text:
+                    context += f"Case: {case['title']}\n{text}\n\n"
 
-    if not context:
+        except Exception as e:
+            print("❌ Context fetch error:", e)
+
+    # =========================
+    # 🚨 FINAL CHECK
+    # =========================
+    if not context or context.strip() == "":
         return {
             "answer": "⚠️ Could not fetch case content.",
             "tool": tool
         }
 
+    # 🔥 LIMIT SIZE
     if len(context) > 12000:
         context = context[:12000]
 
@@ -683,38 +781,86 @@ Reasoning:
 """
     else:
         prompt = f"""
-You are a legal expert.
+You are a senior legal expert.
 
-Compare the following two legal cases based ONLY on the given context.
+Compare the two cases deeply and precisely.
 
 Context:
 {context}
 
-Return structured comparison.
+STRICT FORMAT:
+
+Case 1: {cases[0]['title']}
+Case 2: {cases[1]['title']}
+
+Facts:
+- Case 1:
+- Case 2:
+
+Issues:
+- Case 1:
+- Case 2:
+
+Similarities:
+- Legal principles
+- Constitutional aspects
+
+Differences:
+- Scope
+- Legal impact
+- Articles involved
+
+Judgment:
+- Case 1:
+- Case 2:
+
+Final Insight:
+- 2–3 lines explaining the core legal difference
 """
 
     # =========================
-    # ⚡ LLM
+    # ⚡ MCP TOOL EXECUTION
     # =========================
-    print("🚀 SENDING TO LLM...")
+    print("🚀 USING MCP TOOL...")
+    # =========================
+    # ✅ FINAL RETURN (CRITICAL)
+    # =========================
 
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}]
-        )
+        if tool == "summarize":
+            result = tools["summarize"](context)
 
-        result = completion.choices[0].message.content
-        result = clean_llm_output(result)
+        elif tool == "compare":
+            result = tools["compare"](context, cases)
+
+        else:
+            # fallback (rare)
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = clean_llm_output(completion.choices[0].message.content)
+        print("🧾 RESULT:", result[:500])  # ✅ ADD THIS
+
 
     except Exception as e:
         print("❌ LLM error:", e)
-        result = "⚠️ Failed to generate response."
+    # =========================
+    # ✅ FINAL RETURN (CORRECT PLACE)
+    # =========================
+
+    if not result or str(result).strip() == "":
+        result = "⚠️ No response generated. Try again."
 
     return {
         "answer": result,
         "tool": tool,
-        "cases_used": [c["title"] for c in cases]
+        "cases_used": [
+            {
+                "title": c.get("title"),
+                "link": c.get("link")
+            } for c in cases
+        ] if isinstance(cases, list) else []
     }
 # =========================
 # 📄 SUMMARIZE CASE
@@ -736,12 +882,17 @@ def summarize_case(request: LinkRequest):
 # =========================
 # 🔥 GLOBAL STORE (top of file)
 # 🔥 GLOBAL STORE (KEEP THIS AT TOP OF FILE ONLY ONCE)
+# =========================
+# 📂 FILE UPLOAD (FIXED)
+# =========================
+
+from fastapi import UploadFile, File, Request
+
+# 🔥 GLOBAL STORE (temporary - RAM)
 uploaded_text_store = {}
 
-from fastapi import UploadFile, File
-
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
 
     try:
         # =========================
@@ -760,26 +911,34 @@ async def upload_file(file: UploadFile = File(...)):
             return {"error": "Empty or unreadable document"}
 
         # =========================
-        # 🔥 LIMIT SIZE (IMPORTANT)
+        # 🔥 LIMIT SIZE
         # =========================
         text = text[:20000]
 
         # =========================
-        # 🔥 STORE DOCUMENT ONLY
+        # 🔐 GET USER ID (FIXED)
         # =========================
-        user_id = "guest"   # 🔥 keep simple for now
+        user_id = request.headers.get("user-id")
 
+        # fallback safety
+        if not user_id:
+            user_id = "guest"
+
+        # =========================
+        # 🔥 STORE PER USER
+        # =========================
         uploaded_text_store[user_id] = text
 
         print("📄 Document stored for user:", user_id)
+        print("📊 Stored users:", list(uploaded_text_store.keys()))
         print("TEXT LENGTH:", len(text))
 
         # =========================
-        # ✅ RESPONSE (NO SUMMARY)
+        # ✅ RESPONSE
         # =========================
         return {
             "filename": file.filename,
-            "message": "✅ Document uploaded successfully. Now ask: 'summarize the document'"
+            "message": "✅ Document uploaded successfully. Now ask: 'compare with <case name>'"
         }
 
     except Exception as e:
@@ -787,6 +946,7 @@ async def upload_file(file: UploadFile = File(...)):
         return {
             "error": "⚠️ Upload failed"
         }
+        
 @app.post("/fetch_cases")
 async def fetch_cases_api(request: dict):
 

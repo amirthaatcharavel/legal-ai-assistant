@@ -64,7 +64,6 @@ export default {
       selectedCourt: "All courts",
       selectedYear: "All years",
 
-      // 🔥 NEW (FOR + BUTTON FILE)
       file: null
     };
   },
@@ -107,49 +106,57 @@ export default {
         .filter(c => c.link);
     },
 
-    // =========================
-    // 🔥 FIXED SUMMARY CLEANING
-    // =========================
     parsedSummary() {
       if (!this.response?.answer) return null;
 
       const text = this.response.answer;
 
-      const getSection = (title) => {
-        const regex = new RegExp(
-          `${title}:([\\s\\S]*?)(Facts:|Issue:|Judgment:|Reasoning:|$)`,
-          "i"
-        );
-        const match = text.match(regex);
-        return match ? this.cleanText(match[1]) : "";
+      const sections = {
+        facts: "",
+        issue: "",
+        judgment: "",
+        reasoning: ""
       };
 
-      return {
-        facts: getSection("Facts"),
-        issue: getSection("Issue"),
-        judgment: getSection("Judgment"),
-        reasoning: getSection("Reasoning"),
-      };
+      let current = null;
+
+      text.split("\n").forEach(line => {
+        // Remove markdown bolding and trim to check if line is a header
+        const cleanLine = line.trim().toLowerCase().replace(/[*#]/g, '');
+
+        if (cleanLine.startsWith("facts:") || cleanLine === "facts") current = "facts";
+        else if (cleanLine.startsWith("issue:") || cleanLine === "issue") current = "issue";
+        else if (cleanLine.startsWith("judgment:") || cleanLine === "judgment") current = "judgment";
+        else if (cleanLine.startsWith("reasoning:") || cleanLine === "reasoning") current = "reasoning";
+        else if (current && line.trim()) {
+          sections[current] += line + "\n";
+        }
+      });
+
+      // clean text and filter empty sections
+      const result = {};
+      Object.keys(sections).forEach(key => {
+        const cleaned = this.cleanText(sections[key]);
+        if (cleaned) {
+          result[key] = cleaned;
+        }
+      });
+
+      return Object.keys(result).length > 0 ? result : null;
     }
   },
 
   methods: {
 
-    // =========================
-    // 🔥 NEW CLEAN FUNCTION (ONLY ADDITION)
-    // =========================
     cleanText(text) {
       if (!text) return "";
 
       return text
-        .replace(/\*\*/g, "")        // remove **
-        .replace(/\n\s*\n/g, "\n")   // remove extra gaps
+        .replace(/\*\*/g, "")
+        .replace(/\n\s*\n/g, "\n")
         .trim();
     },
 
-    // =========================
-    // ➕ FILE PICKER (CHATGPT STYLE)
-    // =========================
     triggerFile() {
       this.$refs.fileInput.click();
     },
@@ -159,8 +166,6 @@ export default {
       if (!selected) return;
 
       this.file = selected;
-
-      // 🔥 OPTIONAL: AUTO UPLOAD
       this.uploadFile();
     },
 
@@ -169,10 +174,13 @@ export default {
     },
 
     // =========================
-    // 📂 UPLOAD FILE
+    // 📂 UPLOAD FILE (UNCHANGED)
     // =========================
     async uploadFile() {
       if (!this.file) return;
+
+      const user = auth.currentUser;
+      const uid = user?.uid || "guest";
 
       this.loading = true;
       this.response = null;
@@ -183,6 +191,9 @@ export default {
       try {
         const res = await fetch("http://127.0.0.1:8000/upload", {
           method: "POST",
+          headers: {
+            "user-id": uid
+          },
           body: formData
         });
 
@@ -197,8 +208,8 @@ export default {
         }
 
         this.response = {
-          tool: "Document Summary",
-          answer: data.summary
+          tool: "Upload",
+          answer: data.message
         };
 
       } catch (err) {
@@ -213,7 +224,7 @@ export default {
     },
 
     // =========================
-    // 🔍 ASK API
+    // 🔍 ASK API (FIXED)
     // =========================
     async ask() {
       if (!this.query) return;
@@ -229,7 +240,7 @@ export default {
       this.response = null;
 
       try {
-        const res = await fetch("http://localhost:8000/ask", {
+        const res = await fetch("http://127.0.0.1:8000/ask", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -242,11 +253,29 @@ export default {
           })
         });
 
+        // ✅ HANDLE HTTP ERRORS
+        if (!res.ok) {
+          throw new Error("Server error");
+        }
+
         const data = await res.json();
 
-        this.response = data;
+        console.log("API RESPONSE:", data); // 🔥 DEBUG
 
-        await saveChat(this.query, data.answer);
+        // ✅ SAFE CHECK (VERY IMPORTANT)
+        if (!data || !data.answer) {
+          this.response = {
+            tool: "Error",
+            answer: "⚠️ Invalid response from backend"
+          };
+          return;
+        }
+
+        this.response = data;
+        // 🔥 DEBUG (ADD THIS)
+        console.log("PARSED:", this.parsedSummary);
+
+        await saveChat(this.query, data.answer || "");
 
       } catch (error) {
         console.error(error);
@@ -259,9 +288,6 @@ export default {
       }
     },
 
-    // =========================
-    // 🎯 FILTERS
-    // =========================
     selectCourt(val) {
       this.selectedCourt = val;
       this.courtOpen = false;
@@ -276,9 +302,6 @@ export default {
       this.query = q;
     },
 
-    // =========================
-    // 💾 SAVE RESPONSE
-    // =========================
     async saveResponse() {
       try {
         const user = auth.currentUser;
@@ -290,7 +313,7 @@ export default {
 
         await addDoc(collection(db, "users", user.uid, "saved"), {
           caseTitle: this.parsedCases?.[0]?.title || "Document",
-          summary: this.response.answer,
+          summary: this.response?.answer || "",
           court: this.selectedCourt,
           year: this.selectedYear,
           createdAt: new Date()
@@ -495,8 +518,9 @@ export default {
               )"
          class="space-y-5 mb-6">
 
-      <div v-for="(val, key) in parsedSummary" :key="key"
-           class="flex gap-3 items-start">
+      <div v-for="(val, key) in parsedSummary"
+          :key="key"
+          class="flex gap-3 items-start">
 
         <FileText class="w-5 h-5 text-yellow-400 mt-1" />
 

@@ -161,18 +161,19 @@ Reasoning:
 # 🔥 SIMPLE TEXT SUMMARY (FOR FILE UPLOAD)
 # =========================
 def summarize_text(text):
-    if not text:
-        return "No content to summarize."
+    if not text or len(text.strip()) < 100:
+        return "⚠️ Not enough content to summarize."
 
     import re
 
     # =========================
-    # 🔥 STEP 1 — LIMIT SIZE
+    # 🔥 STEP 1 — CLEAN TEXT
     # =========================
-    text = text[:15000]
+    text = text.replace("\n\n", "\n").strip()
+    text = text[:12000]   # limit size (important)
 
     # =========================
-    # 🔥 STEP 2 — REMOVE LEGAL GARBAGE
+    # 🔥 STEP 2 — REMOVE NOISE
     # =========================
     patterns = [
         r"IA\s*No\.\s*\d+\/\d+.*",
@@ -190,10 +191,9 @@ def summarize_text(text):
         text = re.sub(p, "", text, flags=re.IGNORECASE)
 
     # =========================
-    # 🔥 STEP 3 — REMOVE METADATA LINES
+    # 🔥 STEP 3 — REMOVE METADATA
     # =========================
     lines = text.split("\n")
-    clean_lines = []
 
     skip_words = [
         "equivalent citations",
@@ -205,80 +205,68 @@ def summarize_text(text):
         "appearance",
     ]
 
-    for line in lines:
-        if not any(word in line.lower() for word in skip_words):
-            clean_lines.append(line)
+    clean_lines = [
+        line for line in lines
+        if not any(word in line.lower() for word in skip_words)
+    ]
 
     clean_text = " ".join(clean_lines)
 
     # =========================
-    # 🔥 STEP 4 — SPLIT SENTENCES
+    # 🧠 STEP 4 — LLM SUMMARIZATION (MAIN FIX)
     # =========================
-    sentences = re.split(r'(?<=[.!?]) +', clean_text)
+    prompt = f"""
+You are a HIGHLY INTELLIGENT LEGAL EXPERT.
 
-    # 🔥 Remove very short / useless sentences
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
+Analyze the following Indian Supreme Court case.
 
-    # 🔥 Skip initial garbage (very important)
-    sentences = sentences[5:60]
+⚠️ STRICT RULES:
+- DO NOT leave any section empty
+- Extract REAL legal meaning (not generic sentences)
+- Convert into short bullet points
+- Avoid repetition
+- Be precise and clear
 
-    # =========================
-    # 🧠 STEP 5 — CLASSIFY
-    # =========================
-    facts = []
-    issue = []
-    judgment = []
-    reasoning = []
+=====================
+CASE TEXT:
+{clean_text}
+=====================
 
-    for s in sentences:
-        s_lower = s.lower()
+RETURN ONLY THIS FORMAT:
 
-        if any(word in s_lower for word in ["fact", "background", "arose", "case of"]):
-            facts.append(s)
-
-        elif any(word in s_lower for word in ["issue", "question", "whether"]):
-            issue.append(s)
-
-        elif any(word in s_lower for word in ["held", "court held", "decided", "judgment"]):
-            judgment.append(s)
-
-        elif any(word in s_lower for word in ["reason", "because", "analysis", "observed"]):
-            reasoning.append(s)
-
-    # =========================
-    # 🔁 STEP 6 — FALLBACKS
-    # =========================
-    if not facts:
-        facts = sentences[:3]
-
-    if not issue:
-        issue = sentences[3:6]
-
-    if not judgment:
-        judgment = sentences[6:9]
-
-    if not reasoning:
-        reasoning = sentences[9:12]
-
-    # =========================
-    # 🎯 STEP 7 — FINAL OUTPUT
-    # =========================
-    summary = f"""
 Facts:
-{" ".join(facts[:3])}
+- ...
 
 Issue:
-{" ".join(issue[:2])}
+- ...
 
 Judgment:
-{" ".join(judgment[:2])}
+- ...
 
 Reasoning:
-{" ".join(reasoning[:3])}
+- ...
 """
 
-    summary = make_citations_clickable(summary)
-    return summary.strip()
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+
+        result = completion.choices[0].message.content.strip()
+
+        # =========================
+        # 🔁 FALLBACK IF EMPTY
+        # =========================
+        if not result or len(result) < 50:
+            return "⚠️ Could not generate meaningful summary."
+
+        return make_citations_clickable(result)
+
+    except Exception as e:
+        print("❌ LLM Error:", e)
+        return "⚠️ Error generating summary."
 # =========================
 # 🔥 FILE TEXT EXTRACTION
 # =========================
