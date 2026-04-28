@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global styles */
+body {
+  @apply bg-primary text-white font-sans;
+}
+
+/* Smooth transitions */
+* {
+  @apply transition-all duration-200;
+}
